@@ -1,7 +1,7 @@
 #include <Wire.h>
 // Addresses to probe. Your sensor will be at one of these addresses.
 // We'll scan all three, initialize anything we find, then read temps.
-const uint8_t ADDRS[] = {0x4D, 0x48, 0x4F};
+const uint8_t ADDRS[] = {0x49};
 // Low-level I2C 16-bit helpers
 //    Many temperature ICs (e.g., MAX31875) use 16-bit registers.
 //    These helpers read/write a 16-bit register at <reg> from/to device <a>.
