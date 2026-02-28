@@ -5,7 +5,7 @@
 #include <BLE2902.h>
 
 // I2C addresses to probe
-const uint8_t ADDRS[] = {0x4D, 0x48, 0x4F};
+const uint8_t ADDRS[] = {0x49};
 
 // BLE service/characteristic UUIDs (random example UUIDs, replace if needed)
 #define SERVICE_UUID        "6E400001-B5A3-F393-E0A9-E50E24DCCA9E"
