@@ -4,27 +4,59 @@
 #include <BLEUtils.h>
 #include <BLE2902.h>
 
-// I2C addresses to probe
+// =========================
+// I2C sensor addresses
+// =========================
 const uint8_t ADDRS[] = {0x49};
 
-// BLE service/characteristic UUIDs (random example UUIDs, replace if needed)
-#define SERVICE_UUID        "6E400001-B5A3-F393-E0A9-E50E24DCCA9E"
-#define CHARACTERISTIC_UUID "6E400002-B5A3-F393-E0A9-E50E24DCCA9E"
+// =========================
+// BLE UUIDs
+// Reusing the UUID pattern from the earlier working pset
+// =========================
+#define SERVICE_UUID "7e02cb7a-8f3a-4e4a-94a8-12b9d1c9ea01"
+#define TX_CHAR_UUID "7e02cb7a-8f3a-4e4a-94a8-12b9d1c9ea02"   // ESP32 -> Phone
 
-BLECharacteristic *pCharacteristic;
-bool deviceConnected = false;
+BLEServer* g_server = nullptr;
+BLECharacteristic* g_txChar = nullptr;
+bool g_deviceConnected = false;
 
-// ---------- I2C Helpers ----------
-bool i2cRead16(uint8_t a, uint8_t r, uint16_t &v){
+// =========================
+// BLE server callbacks
+// =========================
+class ServerCallbacks : public BLEServerCallbacks {
+  void onConnect(BLEServer* pServer) override {
+    g_deviceConnected = true;
+    Serial.println("BLE client connected");
+  }
+
+  void onDisconnect(BLEServer* pServer) override {
+    g_deviceConnected = false;
+    Serial.println("BLE client disconnected");
+
+    BLEAdvertising* advertising = BLEDevice::getAdvertising();
+    advertising->addServiceUUID(SERVICE_UUID);
+    advertising->setScanResponse(true);
+    advertising->start();
+
+    Serial.println("Advertising restarted");
+  }
+};
+
+// =========================
+// I2C helper functions
+// =========================
+bool i2cRead16(uint8_t a, uint8_t r, uint16_t &v) {
   Wire.beginTransmission(a);
   Wire.write(r);
   if (Wire.endTransmission(false) != 0) return false;
+
   if (Wire.requestFrom((int)a, 2) != 2) return false;
+
   v = (Wire.read() << 8) | Wire.read();
   return true;
 }
 
-bool i2cWrite16(uint8_t a, uint8_t r, uint16_t v){
+bool i2cWrite16(uint8_t a, uint8_t r, uint16_t v) {
   Wire.beginTransmission(a);
   Wire.write(r);
   Wire.write((uint8_t)(v >> 8));
@@ -32,91 +64,184 @@ bool i2cWrite16(uint8_t a, uint8_t r, uint16_t v){
   return Wire.endTransmission() == 0;
 }
 
-// Masks
-static const uint16_t RES_MASK   = 0x0060; 
-static const uint16_t SHDN_MASK  = 0x0100; 
-static const uint16_t RATE_MASK  = 0x0006; 
-static const uint16_t RATE_1SPS  = 0x0002; 
+// Config masks for MAX31875-like device
+static const uint16_t RES_MASK  = 0x0060;
+static const uint16_t SHDN_MASK = 0x0100;
+static const uint16_t RATE_MASK = 0x0006;
+static const uint16_t RATE_1SPS = 0x0002;
 
-bool force12_and_run(uint8_t a){
+// Force 12-bit resolution, continuous conversion
+bool force12_and_run(uint8_t a) {
   uint16_t cfg_before;
-  if(!i2cRead16(a, 0x01, cfg_before)) return false;
+  if (!i2cRead16(a, 0x01, cfg_before)) return false;
+
   uint16_t cfg = cfg_before;
-  cfg &= ~RES_MASK; cfg |= RES_MASK;  // 12-bit
-  cfg &= ~SHDN_MASK;                  // continuous
+  cfg &= ~RES_MASK;
+  cfg |= RES_MASK;               // set 12-bit
+  cfg &= ~SHDN_MASK;             // continuous mode
   cfg = (cfg & ~RATE_MASK) | RATE_1SPS;
-  if(!i2cWrite16(a, 0x01, cfg)) return false;
+
+  if (!i2cWrite16(a, 0x01, cfg)) return false;
+
   delay(150);
+
   uint16_t cfg_after;
-  if(!i2cRead16(a, 0x01, cfg_after)) return false;
+  if (!i2cRead16(a, 0x01, cfg_after)) return false;
+
   return (((cfg_after >> 5) & 0x3) == 0b11);
 }
 
-bool read12(uint8_t a, float &tC){
+// Read 12-bit temperature
+bool read12(uint8_t a, float &tC) {
   Wire.beginTransmission(a);
   Wire.write(0x00);
   if (Wire.endTransmission(false) != 0) return false;
+
   if (Wire.requestFrom((int)a, 2) != 2) return false;
-  uint16_t w  = (Wire.read() << 8) | Wire.read();
+
+  uint16_t w = (Wire.read() << 8) | Wire.read();
   int16_t raw = ((int16_t)w) >> 4;
+
+  // Sign extend 12-bit value
   if (raw & 0x0800) raw |= 0xF000;
+
   tC = raw * 0.0625f;
   return true;
 }
 
-// ---------- Setup ----------
-void setup() {
-  Serial.begin(115200);
-  Wire.begin();
+// =========================
+// Optional I2C scan helper
+// =========================
+void scanI2C() {
+  Serial.println("Scanning I2C bus...");
+  bool foundAny = false;
 
-  // Init I2C sensors
-  for (uint8_t a : ADDRS){
-    Wire.beginTransmission(a);
-    if (Wire.endTransmission() == 0) {
-      force12_and_run(a);
+  for (uint8_t addr = 1; addr < 127; addr++) {
+    Wire.beginTransmission(addr);
+    uint8_t err = Wire.endTransmission();
+    if (err == 0) {
+      Serial.print("Found I2C device at 0x");
+      if (addr < 0x10) Serial.print("0");
+      Serial.println(addr, HEX);
+      foundAny = true;
     }
   }
 
-  // Init BLE
-  BLEDevice::init("ESP32-TempFiber");
-  BLEServer *pServer = BLEDevice::createServer();
-  BLEService *pService = pServer->createService(SERVICE_UUID);
-
-  pCharacteristic = pService->createCharacteristic(
-    CHARACTERISTIC_UUID,
-    BLECharacteristic::PROPERTY_READ | BLECharacteristic::PROPERTY_NOTIFY
-  );
-  pCharacteristic->addDescriptor(new BLE2902());
-
-  pService->start();
-  pServer->getAdvertising()->start();
-  Serial.println("BLE service started, waiting for nRF Connect...");
+  if (!foundAny) {
+    Serial.println("No I2C devices found.");
+  }
 }
 
-// ---------- Loop ----------
-void loop() {
-  String payload = "";  // will hold all temps
+// =========================
+// Setup
+// =========================
+void setup() {
+  Serial.begin(115200);
+  delay(1000);
 
-  for (uint8_t a : ADDRS){
+  Serial.println();
+  Serial.println("Booting ESP32 I2C Temp + BLE...");
+
+  // Start I2C
+  Wire.begin();
+
+  // Scan for devices
+  scanI2C();
+
+  // Initialize known temp sensors
+  for (uint8_t a : ADDRS) {
     Wire.beginTransmission(a);
-    if (Wire.endTransmission() != 0) continue;
+    if (Wire.endTransmission() == 0) {
+      Serial.print("Configuring sensor at 0x");
+      if (a < 0x10) Serial.print("0");
+      Serial.print(a, HEX);
 
-    float tC;
-    if (read12(a, tC)){
-      payload += "Addr 0x";
-      if(a<0x10) payload += "0";
-      payload += String(a, HEX);
-      payload += ": ";
-      payload += String(tC, 2);
-      payload += " C  |  ";
+      if (force12_and_run(a)) {
+        Serial.println(" -> set to 12-bit OK");
+      } else {
+        Serial.println(" -> FAILED to configure");
+      }
+    } else {
+      Serial.print("Sensor not found at 0x");
+      if (a < 0x10) Serial.print("0");
+      Serial.println(a, HEX);
     }
   }
 
-  if (payload.length() > 0) {
-    Serial.println(payload);
-    pCharacteristic->setValue(payload.c_str());
-    pCharacteristic->notify();  // send to nRF Connect
-  }
+  // Start BLE
+  BLEDevice::init("ESP32-TempFiber");
 
-  delay(1000); // 1 Hz updates
+  g_server = BLEDevice::createServer();
+  g_server->setCallbacks(new ServerCallbacks());
+
+  BLEService* service = g_server->createService(SERVICE_UUID);
+
+  g_txChar = service->createCharacteristic(
+    TX_CHAR_UUID,
+    BLECharacteristic::PROPERTY_NOTIFY |
+    BLECharacteristic::PROPERTY_READ
+  );
+
+  g_txChar->addDescriptor(new BLE2902());
+  g_txChar->setValue("BLE Ready");
+
+  service->start();
+
+  BLEAdvertising* advertising = BLEDevice::getAdvertising();
+  advertising->addServiceUUID(SERVICE_UUID);
+  advertising->setScanResponse(true);
+  advertising->start();
+
+  Serial.println("BLE advertising started.");
+  Serial.println("Open nRF Connect, connect, and enable notifications.");
+}
+
+// =========================
+// Main loop
+// =========================
+void loop() {
+  static uint32_t lastMs = 0;
+
+  if (millis() - lastMs >= 1000) {
+    lastMs = millis();
+
+    String payload = "";
+
+    for (uint8_t a : ADDRS) {
+      Wire.beginTransmission(a);
+      if (Wire.endTransmission() != 0) {
+        continue;
+      }
+
+      float tC;
+      if (read12(a, tC)) {
+        payload += "Addr 0x";
+        if (a < 0x10) payload += "0";
+        payload += String(a, HEX);
+        payload += ": ";
+        payload += String(tC, 2);
+        payload += " C";
+      } else {
+        payload += "Addr 0x";
+        if (a < 0x10) payload += "0";
+        payload += String(a, HEX);
+        payload += ": read failed";
+      }
+
+      payload += "  |  ";
+    }
+
+    if (payload.length() == 0) {
+      payload = "No sensor data";
+    }
+
+    Serial.println(payload);
+
+    g_txChar->setValue(payload.c_str());
+
+    if (g_deviceConnected) {
+      g_txChar->notify();
+      Serial.println("Notification sent");
+    }
+  }
 }
